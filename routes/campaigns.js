@@ -147,6 +147,60 @@ router.post('/:id/resume', async (req, res) => {
   }
 });
 
+router.put('/:id', async (req, res) => {
+  try {
+    const campaign = await db.get('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    const {
+      name, subject, body_html, body_plain,
+      contact_list, delay_seconds, start_time, end_time,
+      schedule_type, content_variations, content_mode
+    } = req.body;
+
+    if (!name) return res.status(400).json({ error: 'Campaign name is required' });
+    if (!contact_list) return res.status(400).json({ error: 'Contact list is required' });
+
+    let parsedVariations = [];
+    try {
+      parsedVariations = JSON.parse(content_variations || '[]');
+    } catch (e) {
+      parsedVariations = [];
+    }
+
+    const contacts = await db.get(
+      'SELECT COUNT(*) as count FROM contacts WHERE list_name = $1',
+      [contact_list]
+    );
+
+    await db.run(`
+      UPDATE campaigns SET
+        name = $1, subject = $2, body_html = $3, body_plain = $4,
+        contact_list = $5, delay_seconds = $6, start_time = $7, end_time = $8,
+        total_contacts = $9, schedule_type = $10, content_variations = $11, content_mode = $12
+      WHERE id = $13
+    `, [
+      name,
+      subject || (parsedVariations[0]?.subject || ''),
+      body_html || (parsedVariations[0]?.body_html || ''),
+      body_plain || (parsedVariations[0]?.body_plain || ''),
+      contact_list,
+      delay_seconds || 30,
+      start_time || '00:00',
+      end_time || '23:59',
+      contacts.count,
+      schedule_type || 'immediate',
+      JSON.stringify(parsedVariations),
+      content_mode || 'random',
+      req.params.id
+    ]);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.delete('/:id', async (req, res) => {
   try {
     await db.run('DELETE FROM queue WHERE campaign_id = $1', [req.params.id]);

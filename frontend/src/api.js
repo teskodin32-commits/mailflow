@@ -23,6 +23,7 @@ export const createCampaign = (data) => API.post('/api/campaigns', data);
 export const launchCampaign = (id) => API.post(`/api/campaigns/${id}/launch`);
 export const pauseCampaign = (id) => API.post(`/api/campaigns/${id}/pause`);
 export const resumeCampaign = (id) => API.post(`/api/campaigns/${id}/resume`);
+export const updateCampaign = (id, data) => API.put(`/api/campaigns/${id}`, data);
 export const deleteCampaign = (id) => API.delete(`/api/campaigns/${id}`);
 
 // Templates

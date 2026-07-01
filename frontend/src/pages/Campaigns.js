@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { getCampaigns, createCampaign, launchCampaign, pauseCampaign, resumeCampaign, deleteCampaign, getContactLists, getTemplates } from '../api';
+import { getCampaigns, createCampaign, updateCampaign, launchCampaign, pauseCampaign, resumeCampaign, deleteCampaign, getContactLists, getTemplates } from '../api';
 
 const s = {
   title: { fontSize: '20px', fontWeight: '500', color: '#111', marginBottom: '4px' },
@@ -159,6 +159,7 @@ export default function Campaigns() {
   const [lists, setLists] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [showForm, setShowForm] = useState(false);
+  const [editingCampaign, setEditingCampaign] = useState(null);
   const [msg, setMsg] = useState(null);
   const [err, setErr] = useState(null);
   const [variations, setVariations] = useState([emptyVariation()]);
@@ -227,10 +228,39 @@ export default function Campaigns() {
 
   const resetForm = () => {
     setShowForm(false);
+    setEditingCampaign(null);
     setForm({ name: '', contact_list: '', start_time: '08:00', end_time: '22:00' });
     setVariations([emptyVariation()]);
     setSpeed(30);
     setScheduleType('immediate');
+  };
+
+  const handleEdit = (c) => {
+    setEditingCampaign(c);
+    setShowForm(false);
+    let parsedVariations = [];
+    try { parsedVariations = JSON.parse(c.content_variations || '[]'); } catch (e) {}
+    if (parsedVariations.length === 0) parsedVariations = [emptyVariation()];
+    setForm({
+      name: c.name || '',
+      contact_list: c.contact_list || '',
+      start_time: c.start_time || '08:00',
+      end_time: c.end_time || '22:00',
+    });
+    setVariations(parsedVariations.map(v => ({ ...v, id: v.id || Date.now() + Math.random() })));
+    setSpeed(c.delay_seconds || 30);
+    setScheduleType(c.schedule_type || 'immediate');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleUpdate = async () => {
+    if (!validate()) return;
+    try {
+      await updateCampaign(editingCampaign.id, buildPayload());
+      showMsg('Campaign updated successfully!');
+      resetForm();
+      load();
+    } catch (e) { showErr(e.response?.data?.error || 'Error updating campaign'); }
   };
 
   const handleSaveDraft = async () => {
@@ -297,17 +327,20 @@ export default function Campaigns() {
           <div style={s.title}>Campaigns</div>
           <div style={s.sub}>Create and manage your email campaigns</div>
         </div>
-        <button style={s.btnPrimary} onClick={() => setShowForm(!showForm)}>
-          {showForm ? 'Cancel' : '+ New campaign'}
+        <button style={s.btnPrimary} onClick={() => {
+          if (editingCampaign) { resetForm(); return; }
+          setShowForm(!showForm);
+        }}>
+          {(showForm || editingCampaign) ? 'Cancel' : '+ New campaign'}
         </button>
       </div>
 
       {msg && <div style={s.success}>{msg}</div>}
       {err && <div style={s.error}>{err}</div>}
 
-      {showForm && (
+      {(showForm || editingCampaign) && (
         <div style={s.card}>
-          <div style={s.cardTitle}>New campaign</div>
+          <div style={s.cardTitle}>{editingCampaign ? `Editing: ${editingCampaign.name}` : 'New campaign'}</div>
 
           <div style={s.row2}>
             <div>
@@ -399,8 +432,17 @@ export default function Campaigns() {
           </div>
 
           <div style={s.footerBtns}>
-            <button style={s.btn} onClick={handleSaveDraft}>Save as draft</button>
-            <button style={s.btnSuccess} onClick={handleCreateAndLaunch}>Launch campaign</button>
+            {editingCampaign ? (
+              <>
+                <button style={s.btn} onClick={resetForm}>Cancel</button>
+                <button style={s.btnSuccess} onClick={handleUpdate}>Save changes</button>
+              </>
+            ) : (
+              <>
+                <button style={s.btn} onClick={handleSaveDraft}>Save as draft</button>
+                <button style={s.btnSuccess} onClick={handleCreateAndLaunch}>Launch campaign</button>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -430,6 +472,7 @@ export default function Campaigns() {
             {c.status === 'draft' && <button style={s.btn} onClick={() => handleLaunch(c.id)}>Launch</button>}
             {c.status === 'running' && <button style={s.btn} onClick={() => handlePause(c.id)}>Pause</button>}
             {c.status === 'paused' && <button style={s.btn} onClick={() => handleResume(c.id)}>Resume</button>}
+            <button style={s.btn} onClick={() => handleEdit(c)}>Edit</button>
             <button style={s.btnDanger} onClick={() => handleDelete(c.id)}>Delete</button>
           </div>
         ))}

@@ -75,20 +75,34 @@ const emptyVariation = () => ({
 function VariationEditor({ variation, index, onChange, onRemove, showRemove, templates }) {
   const previewRef = useRef(null);
   const [selectedTemplate, setSelectedTemplate] = useState('');
+  const [bodyMode, setBodyMode] = useState(variation.body_html ? 'html' : 'plain');
 
   useEffect(() => {
-    if (previewRef.current) {
+    if (bodyMode === 'html' && previewRef.current) {
       previewRef.current.srcdoc = `<html><body style="font-family:-apple-system,sans-serif;padding:16px;margin:0;font-size:13px;line-height:1.7;color:#111;">${variation.body_html || '<p style="color:#aaa;">HTML preview will appear here...</p>'}</body></html>`;
     }
-  }, [variation.body_html]);
+  }, [variation.body_html, bodyMode]);
 
   const applyTemplate = () => {
     if (!selectedTemplate) return;
     const t = templates.find(t => t.id === parseInt(selectedTemplate));
     if (!t) return;
     onChange({ ...variation, subject: t.subject || '', body_html: t.body_html || '', body_plain: t.body_plain || '' });
+    if (t.body_html) setBodyMode('html');
+    else if (t.body_plain) setBodyMode('plain');
     setSelectedTemplate('');
   };
+
+  const toggleStyle = (active) => ({
+    padding: '4px 12px',
+    fontSize: '12px',
+    borderRadius: '6px',
+    border: active ? '1.5px solid #185FA5' : '0.5px solid #ccc',
+    background: active ? '#e6f1fb' : '#fff',
+    color: active ? '#185FA5' : '#666',
+    cursor: 'pointer',
+    fontWeight: active ? '500' : '400',
+  });
 
   return (
     <div style={s.variationCard}>
@@ -120,36 +134,44 @@ function VariationEditor({ variation, index, onChange, onRemove, showRemove, tem
         onChange={e => onChange({ ...variation, subject: e.target.value })}
       />
 
-      <div style={s.label}>HTML body <span style={s.hintText}>(optional)</span></div>
-      <div style={s.editorWrap}>
-        <div>
-          <div style={s.editorHeader}>HTML editor</div>
-          <textarea
-            style={s.editorTextarea}
-            placeholder="Paste your HTML here... or leave empty"
-            value={variation.body_html}
-            onChange={e => onChange({ ...variation, body_html: e.target.value })}
-            spellCheck={false}
-          />
-        </div>
-        <div>
-          <div style={s.editorHeader}>Live preview</div>
-          <iframe
-            ref={previewRef}
-            style={{ width: '100%', minHeight: '180px', border: 'none' }}
-            title={`preview-${index}`}
-            sandbox="allow-same-origin"
-          />
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '10px', marginBottom: '6px' }}>
+        <div style={s.label}>Body <span style={s.hintText}>(optional)</span></div>
+        <div style={{ display: 'flex', gap: '6px' }}>
+          <button style={toggleStyle(bodyMode === 'plain')} onClick={() => setBodyMode('plain')}>Plain text</button>
+          <button style={toggleStyle(bodyMode === 'html')} onClick={() => setBodyMode('html')}>HTML</button>
         </div>
       </div>
 
-      <div style={s.label}>Plain text <span style={s.hintText}>(optional)</span></div>
-      <textarea
-        style={s.plainTextarea}
-        placeholder="Plain text version... or leave empty"
-        value={variation.body_plain}
-        onChange={e => onChange({ ...variation, body_plain: e.target.value })}
-      />
+      {bodyMode === 'plain' ? (
+        <textarea
+          style={{ ...s.plainTextarea, minHeight: '180px' }}
+          placeholder="Write your email in plain text..."
+          value={variation.body_plain}
+          onChange={e => onChange({ ...variation, body_plain: e.target.value })}
+        />
+      ) : (
+        <div style={s.editorWrap}>
+          <div>
+            <div style={s.editorHeader}>HTML editor</div>
+            <textarea
+              style={s.editorTextarea}
+              placeholder="Paste your HTML here... or leave empty"
+              value={variation.body_html}
+              onChange={e => onChange({ ...variation, body_html: e.target.value })}
+              spellCheck={false}
+            />
+          </div>
+          <div>
+            <div style={s.editorHeader}>Live preview</div>
+            <iframe
+              ref={previewRef}
+              style={{ width: '100%', minHeight: '180px', border: 'none' }}
+              title={`preview-${index}`}
+              sandbox="allow-same-origin"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

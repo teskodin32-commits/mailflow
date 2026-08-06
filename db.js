@@ -8,6 +8,7 @@ const pool = new Pool({
 async function initDB() {
   const client = await pool.connect();
   try {
+    // Create tables for fresh installs
     await client.query(`
       CREATE TABLE IF NOT EXISTS accounts (
         id SERIAL PRIMARY KEY,
@@ -28,9 +29,6 @@ async function initDB() {
         email TEXT NOT NULL,
         created_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')
       );
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_list_email 
-        ON contacts(list_name, email);
 
       CREATE TABLE IF NOT EXISTS campaigns (
         id SERIAL PRIMARY KEY,
@@ -86,8 +84,6 @@ async function initDB() {
         retry_count INTEGER DEFAULT 0,
         created_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')
       );
-
-      CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
 
       CREATE TABLE IF NOT EXISTS opens (
         id SERIAL PRIMARY KEY,
@@ -148,7 +144,23 @@ async function initDB() {
         created_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')
       );
     `);
-    console.log('Database initialized successfully');
+
+    // MIGRATE: Add missing columns to existing tables
+    await client.query(`
+      ALTER TABLE queue ADD COLUMN IF NOT EXISTS message_id TEXT;
+      ALTER TABLE queue ADD COLUMN IF NOT EXISTS thread_id TEXT;
+      ALTER TABLE followup_queue ADD COLUMN IF NOT EXISTS thread_id TEXT;
+    `);
+
+    // MIGRATE: Add indexes for performance
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_list_email ON contacts(list_name, email);
+      CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_queue_campaign_status ON queue(campaign_id, status);
+      CREATE INDEX IF NOT EXISTS idx_followup_queue_status ON followup_queue(status, scheduled_at);
+    `);
+
+    console.log('Database initialized and migrated successfully');
   } finally {
     client.release();
   }

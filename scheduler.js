@@ -271,4 +271,176 @@ async function processCampaign(campaign) {
         [retryCount, err.message, newAccountId, queueItem.id]
       );
       await db.run(
-        "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message, retry_count) VALUES ($
+        "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message, retry_count) VALUES ($1, $2, $3, 'retrying', $4, $5)",
+        [campaign.id, queueItem.acc_id, queueItem.recipient_email, `Failed: ${err.message}`, retryCount]
+      );
+    } else {
+      await db.run(
+        "UPDATE queue SET status = 'failed', error = $1, retry_count = $2 WHERE id = $3",
+        [err.message, retryCount, queueItem.id]
+      );
+      await db.run('UPDATE campaigns SET failed_count = failed_count + 1 WHERE id = $1', [campaign.id]);
+      await db.run(
+        "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message, retry_count) VALUES ($1, $2, $3, 'failed', $4, $5)",
+        [campaign.id, queueItem.acc_id, queueItem.recipient_email, `Permanently failed: ${err.message}`, retryCount]
+      );
+    }
+  }
+}
+
+async function processFollowups() {
+  try {
+    const now = new Date().toISOString();
+
+    const pendingFollowups = await db.all(`
+      SELECT fq.*,
+        f.subject as followup_subject,
+        f.body_html as followup_body_html,
+        f.body_plain as followup_body_plain,
+        f.status as followup_status,
+        a.email as account_email,
+        a.display_name as account_display_name,
+        a.access_token, a.refresh_token, a.token_expiry,
+        a.id as acc_id
+      FROM followup_queue fq
+      JOIN followups f ON fq.followup_id = f.id
+      JOIN accounts a ON fq.account_id = a.id
+      WHERE fq.status = 'pending'
+      AND fq.scheduled_at <= $1
+      AND f.status = 'active'
+      AND a.status = 'active'
+      ORDER BY fq.scheduled_at ASC
+      LIMIT 5
+    `, [now]);
+
+    for (const item of pendingFollowups) {
+      const excluded = await db.get(
+        'SELECT id FROM exclusions WHERE email = $1 AND (campaign_id = $2 OR campaign_id IS NULL)',
+        [item.recipient_email, item.campaign_id]
+      );
+
+      if (excluded) {
+        await db.run("UPDATE followup_queue SET status = 'excluded' WHERE id = $1", [item.id]);
+        continue;
+      }
+
+      try {
+        console.log(`[FOLLOWUP] Sending to ${item.recipient_email} via ${item.account_email}`);
+
+        const auth = await getAuthForAccount({
+          id: item.acc_id,
+          access_token: item.access_token,
+          refresh_token: item.refresh_token,
+          token_expiry: item.token_expiry
+        });
+
+        const gmail = google.gmail({ version: 'v1', auth });
+
+        let replySubject = item.followup_subject;
+        if (!replySubject || !replySubject.trim()) {
+          const campaign = await db.get('SELECT * FROM campaigns WHERE id = $1', [item.campaign_id]);
+          const originalSubject = campaign?.subject || '';
+          replySubject = originalSubject ? `Re: ${originalSubject}` : '';
+        }
+
+        const raw = makeEmail(
+          item.recipient_email,
+          item.account_display_name,
+          item.account_email,
+          replySubject,
+          item.followup_body_html,
+          item.followup_body_plain,
+          item.id
+        );
+
+        const sendOptions = { userId: 'me', requestBody: { raw } };
+        if (item.thread_id) {
+          sendOptions.requestBody.threadId = item.thread_id;
+        }
+
+        await gmail.users.messages.send(sendOptions);
+
+        await db.run(
+          "UPDATE followup_queue SET status = 'sent', sent_at = to_char(now(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = $1",
+          [item.id]
+        );
+
+        await db.run(
+          "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message) VALUES ($1, $2, $3, 'sent', $4)",
+          [item.campaign_id, item.acc_id, item.recipient_email, `Follow-up sent: ${replySubject || '(no subject)'}`]
+        );
+
+        console.log(`✓ Followup sent to ${item.recipient_email}`);
+
+      } catch (err) {
+        console.error(`✗ Followup failed: ${item.recipient_email}: ${err.message}`);
+        const retryCount = (item.retry_count || 0) + 1;
+
+        if (retryCount < MAX_RETRIES) {
+          await db.run(
+            "UPDATE followup_queue SET retry_count = $1, error = $2 WHERE id = $3",
+            [retryCount, err.message, item.id]
+          );
+        } else {
+          await db.run(
+            "UPDATE followup_queue SET status = 'failed', error = $1, retry_count = $2 WHERE id = $3",
+            [err.message, retryCount, item.id]
+          );
+          await db.run(
+            "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message) VALUES ($1, $2, $3, 'failed', $4)",
+            [item.campaign_id, item.acc_id, item.recipient_email, `Follow-up failed: ${err.message}`]
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Followup scheduler error:', err.message);
+  }
+}
+
+async function processAllCampaigns() {
+  try {
+    const runningCampaigns = await db.all("SELECT * FROM campaigns WHERE status = 'running'");
+    if (runningCampaigns.length === 0) return;
+    for (const campaign of runningCampaigns) {
+      await processCampaign(campaign);
+    }
+  } catch (err) {
+    console.error('Scheduler error:', err.message);
+  }
+}
+
+// Reset daily counts at midnight
+cron.schedule('0 0 * * *', async () => {
+  await db.run("UPDATE accounts SET daily_sent = 0, last_reset = to_char(now(), 'YYYY-MM-DD HH24:MI:SS')");
+  console.log('Daily sent counts reset');
+});
+
+// Main campaign scheduler — every 2 seconds
+cron.schedule('*/2 * * * * *', async () => {
+  await processAllCampaigns();
+});
+
+// Followup scheduler — every 60 seconds
+cron.schedule('* * * * *', async () => {
+  await processFollowups();
+});
+
+console.log('Scheduler started — campaigns every 2s, followups every 60s');
+
+const PORT = process.env.PORT || 3000;
+const RENDER_PING_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(async () => {
+  try {
+    const https = require('https');
+    const http = require('http');
+    const client = RENDER_PING_URL.startsWith('https') ? https : http;
+    client.get(`${RENDER_PING_URL}/api/queue/stats`, (res) => {
+      console.log(`Keep-alive ping sent — status: ${res.statusCode}`);
+    }).on('error', (err) => {
+      console.log(`Keep-alive ping failed: ${err.message}`);
+    });
+  } catch (err) {
+    console.log(`Keep-alive error: ${err.message}`);
+  }
+}, 5 * 60 * 1000);

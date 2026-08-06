@@ -20,19 +20,25 @@ async function getAuthForAccount(account) {
   });
 
   if (Date.now() > account.token_expiry) {
-    const { credentials } = await accountClient.refreshAccessToken();
-    await db.run(
-      'UPDATE accounts SET access_token = $1, token_expiry = $2 WHERE id = $3',
-      [credentials.access_token, credentials.expiry_date, account.id]
-    );
-    accountClient.setCredentials(credentials);
+    try {
+      const { credentials } = await accountClient.refreshAccessToken();
+      await db.run(
+        'UPDATE accounts SET access_token = $1, token_expiry = $2 WHERE id = $3',
+        [credentials.access_token, credentials.expiry_date, account.id]
+      );
+      accountClient.setCredentials(credentials);
+    } catch (refreshErr) {
+      console.error(`Token refresh failed for ${account.email || account.id}:`, refreshErr.message);
+      await db.run("UPDATE accounts SET status = 'error' WHERE id = $1", [account.id]);
+      throw refreshErr;
+    }
   }
 
   return accountClient;
 }
 
 function trackingPixel(queueId) {
-  return `<img src="${RENDER_URL}/api/track/open?id=${queueId}" width="1" height="1" style="display:none;border:0;outline:0;" alt="" />`;
+  return `<img src="${RENDER_URL}/api/track/open?id=${queueId}" width="1" height="1" alt="" />`;
 }
 
 function plainTextToHtml(text, queueId) {
@@ -42,7 +48,7 @@ function plainTextToHtml(text, queueId) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/\n/g, '<br>');
-  return `<div style="font-family:sans-serif;font-size:14px;line-height:1.6;color:#333;">${escaped}</div>${trackingPixel(queueId)}`;
+  return `<p>${escaped}</p>\n${trackingPixel(queueId)}`;
 }
 
 function injectTracking(html, queueId) {
@@ -58,7 +64,7 @@ function injectTracking(html, queueId) {
   return `${trackedHtml}\n${trackingPixel(queueId)}`;
 }
 
-function makeEmail(to, fromName, fromEmail, subject, bodyHtml, bodyPlain, queueId, replyToMessageId) {
+function makeEmail(to, fromName, fromEmail, subject, bodyHtml, bodyPlain, queueId) {
   const boundary = 'mailflow_boundary';
   const fromField = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
 
@@ -86,15 +92,8 @@ function makeEmail(to, fromName, fromEmail, subject, bodyHtml, bodyPlain, queueI
     `From: ${fromField}`,
     `Subject: ${finalSubject}`,
     'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`
   ];
-
-  // Add threading headers for follow-ups
-  if (replyToMessageId) {
-    headers.push(`In-Reply-To: ${replyToMessageId}`);
-    headers.push(`References: ${replyToMessageId}`);
-  }
-
-  headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
 
   const message = [
     ...headers,
@@ -212,16 +211,15 @@ async function processCampaign(campaign) {
       content.subject,
       content.body_html,
       content.body_plain,
-      queueItem.id,
-      null
+      queueItem.id
     );
 
     const response = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
 
-    // Store message ID and thread ID for follow-up threading
     const messageId = response.data.id;
     const threadId = response.data.threadId;
 
+    // CORE: Mark as sent and log (this must not fail)
     await db.run(
       "UPDATE queue SET status = 'sent', sent_at = to_char(now(), 'YYYY-MM-DD HH24:MI:SS'), message_id = $1, thread_id = $2 WHERE id = $3",
       [messageId, threadId, queueItem.id]
@@ -233,29 +231,32 @@ async function processCampaign(campaign) {
       [campaign.id, queueItem.acc_id, queueItem.recipient_email, `Sent: ${content.subject || '(no subject)'}`, queueItem.retry_count || 0]
     );
 
-    // Add to any existing followup queues for this campaign
-    const followups = await db.all(
-      "SELECT * FROM followups WHERE campaign_id = $1 AND status = 'active'",
-      [campaign.id]
-    );
-
-    for (const followup of followups) {
-      const sentAt = new Date();
-      const scheduledAt = new Date(sentAt.getTime() + (followup.delay_days * 24 * 60 * 60 * 1000) + (followup.delay_hours * 60 * 60 * 1000));
-
-      // Check if not excluded
-      const excluded = await db.get(
-        'SELECT id FROM exclusions WHERE email = $1 AND (campaign_id = $2 OR campaign_id IS NULL)',
-        [queueItem.recipient_email, campaign.id]
+    // NON-CORE: Build followup queue (wrapped so it can't break the send)
+    try {
+      const followups = await db.all(
+        "SELECT * FROM followups WHERE campaign_id = $1 AND status = 'active'",
+        [campaign.id]
       );
 
-      if (!excluded) {
-        await db.run(`
-          INSERT INTO followup_queue 
-            (followup_id, campaign_id, recipient_email, account_id, original_queue_id, message_id, status, scheduled_at)
-          VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-        `, [followup.id, campaign.id, queueItem.recipient_email, queueItem.acc_id, queueItem.id, messageId, scheduledAt.toISOString()]);
+      for (const followup of followups) {
+        const excluded = await db.get(
+          'SELECT id FROM exclusions WHERE email = $1 AND (campaign_id = $2 OR campaign_id IS NULL)',
+          [queueItem.recipient_email, campaign.id]
+        );
+
+        if (!excluded) {
+          const sentAt = new Date();
+          const scheduledAt = new Date(sentAt.getTime() + (followup.delay_days * 24 * 60 * 60 * 1000) + (followup.delay_hours * 60 * 60 * 1000));
+
+          await db.run(`
+            INSERT INTO followup_queue
+            (followup_id, campaign_id, recipient_email, account_id, original_queue_id, message_id, thread_id, status, scheduled_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+          `, [followup.id, campaign.id, queueItem.recipient_email, queueItem.acc_id, queueItem.id, messageId, threadId, scheduledAt.toISOString()]);
+        }
       }
+    } catch (followupErr) {
+      console.error('Followup queue build error:', followupErr.message);
     }
 
     console.log(`✓ Sent to ${queueItem.recipient_email}`);
@@ -289,7 +290,6 @@ async function processCampaign(campaign) {
   }
 }
 
-// Process follow-up queue
 async function processFollowups() {
   try {
     const now = new Date().toISOString();
@@ -308,15 +308,14 @@ async function processFollowups() {
       JOIN followups f ON fq.followup_id = f.id
       JOIN accounts a ON fq.account_id = a.id
       WHERE fq.status = 'pending'
-        AND fq.scheduled_at <= $1
-        AND f.status = 'active'
-        AND a.status = 'active'
+      AND fq.scheduled_at <= $1
+      AND f.status = 'active'
+      AND a.status = 'active'
       ORDER BY fq.scheduled_at ASC
       LIMIT 5
     `, [now]);
 
     for (const item of pendingFollowups) {
-      // Double check not excluded
       const excluded = await db.get(
         'SELECT id FROM exclusions WHERE email = $1 AND (campaign_id = $2 OR campaign_id IS NULL)',
         [item.recipient_email, item.campaign_id]
@@ -339,13 +338,8 @@ async function processFollowups() {
 
         const gmail = google.gmail({ version: 'v1', auth });
 
-        // Get original message details for threading
-        let originalMessageId = item.message_id;
         let replySubject = item.followup_subject;
-
-        // If subject is empty, get original and prefix with Re:
         if (!replySubject || !replySubject.trim()) {
-          const originalQueue = await db.get('SELECT * FROM queue WHERE id = $1', [item.original_queue_id]);
           const campaign = await db.get('SELECT * FROM campaigns WHERE id = $1', [item.campaign_id]);
           const originalSubject = campaign?.subject || '';
           replySubject = originalSubject ? `Re: ${originalSubject}` : '';
@@ -358,14 +352,12 @@ async function processFollowups() {
           replySubject,
           item.followup_body_html,
           item.followup_body_plain,
-          item.id,
-          originalMessageId ? `<${originalMessageId}>` : null
+          item.id
         );
 
-        // Send as reply in same thread
         const sendOptions = { userId: 'me', requestBody: { raw } };
-        if (item.message_id) {
-          sendOptions.requestBody.threadId = item.message_id;
+        if (item.thread_id) {
+          sendOptions.requestBody.threadId = item.thread_id;
         }
 
         await gmail.users.messages.send(sendOptions);
@@ -373,6 +365,11 @@ async function processFollowups() {
         await db.run(
           "UPDATE followup_queue SET status = 'sent', sent_at = to_char(now(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = $1",
           [item.id]
+        );
+
+        await db.run(
+          "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message) VALUES ($1, $2, $3, 'sent', $4)",
+          [item.campaign_id, item.acc_id, item.recipient_email, `Follow-up sent: ${replySubject || '(no subject)'}`]
         );
 
         console.log(`✓ Followup sent to ${item.recipient_email}`);
@@ -391,6 +388,10 @@ async function processFollowups() {
             "UPDATE followup_queue SET status = 'failed', error = $1, retry_count = $2 WHERE id = $3",
             [err.message, retryCount, item.id]
           );
+          await db.run(
+            "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message) VALUES ($1, $2, $3, 'failed', $4)",
+            [item.campaign_id, item.acc_id, item.recipient_email, `Follow-up failed: ${err.message}`]
+          );
         }
       }
     }
@@ -403,7 +404,9 @@ async function processAllCampaigns() {
   try {
     const runningCampaigns = await db.all("SELECT * FROM campaigns WHERE status = 'running'");
     if (runningCampaigns.length === 0) return;
-    await Promise.all(runningCampaigns.map(campaign => processCampaign(campaign)));
+    for (const campaign of runningCampaigns) {
+      await processCampaign(campaign);
+    }
   } catch (err) {
     console.error('Scheduler error:', err.message);
   }
@@ -426,3 +429,21 @@ cron.schedule('* * * * *', async () => {
 });
 
 console.log('Scheduler started — campaigns every 2s, followups every 60s');
+
+const PORT = process.env.PORT || 3000;
+// Keep-alive ping every 5 minutes to prevent Render from sleeping
+const RENDER_PING_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(async () => {
+  try {
+    const https = require('https');
+    const http = require('http');
+    const client = RENDER_PING_URL.startsWith('https') ? https : http;
+    client.get(`${RENDER_PING_URL}/api/queue/stats`, (res) => {
+      console.log(`Keep-alive ping sent — status: ${res.statusCode}`);
+    }).on('error', (err) => {
+      console.log(`Keep-alive ping failed: ${err.message}`);
+    });
+  } catch (err) {
+    console.log(`Keep-alive error: ${err.message}`);
+  }
+}, 5 * 60 * 1000);

@@ -215,13 +215,13 @@ async function processCampaign(campaign) {
     );
 
     const response = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
-
     const messageId = response.data.id;
     const threadId = response.data.threadId;
 
+    // === CRITICAL: These must never fail ===
     await db.run(
-      "UPDATE queue SET status = 'sent', sent_at = to_char(now(), 'YYYY-MM-DD HH24:MI:SS'), message_id = $1, thread_id = $2 WHERE id = $3",
-      [messageId, threadId, queueItem.id]
+      "UPDATE queue SET status = 'sent', sent_at = to_char(now(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = $1",
+      [queueItem.id]
     );
     await db.run('UPDATE campaigns SET sent_count = sent_count + 1 WHERE id = $1', [campaign.id]);
     await db.run('UPDATE accounts SET daily_sent = daily_sent + 1 WHERE id = $1', [queueItem.acc_id]);
@@ -229,8 +229,15 @@ async function processCampaign(campaign) {
       "INSERT INTO logs (campaign_id, account_id, recipient_email, status, message, retry_count) VALUES ($1, $2, $3, 'sent', $4, $5)",
       [campaign.id, queueItem.acc_id, queueItem.recipient_email, `Sent: ${content.subject || '(no subject)'}`, queueItem.retry_count || 0]
     );
+    // === End critical ===
 
+    // === OPTIONAL: Store message_id, thread_id, build followup queue ===
     try {
+      await db.run(
+        "UPDATE queue SET message_id = $1, thread_id = $2 WHERE id = $3",
+        [messageId, threadId, queueItem.id]
+      );
+
       const followups = await db.all(
         "SELECT * FROM followups WHERE campaign_id = $1 AND status = 'active'",
         [campaign.id]
@@ -253,9 +260,10 @@ async function processCampaign(campaign) {
           `, [followup.id, campaign.id, queueItem.recipient_email, queueItem.acc_id, queueItem.id, messageId, threadId, scheduledAt.toISOString()]);
         }
       }
-    } catch (followupErr) {
-      console.error('Followup queue build error:', followupErr.message);
+    } catch (optErr) {
+      console.error('Optional post-send update failed (non-critical):', optErr.message);
     }
+    // === End optional ===
 
     console.log(`✓ Sent to ${queueItem.recipient_email}`);
 

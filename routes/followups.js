@@ -21,7 +21,6 @@ router.post('/', async (req, res) => {
     const { campaign_id, name, subject, body_html, body_plain, delay_days, delay_hours } = req.body;
     if (!campaign_id) return res.status(400).json({ error: 'Campaign ID is required' });
 
-    // Use exact values — no fallback to 3
     const days = delay_days !== undefined && delay_days !== null ? parseInt(delay_days) : 0;
     const hours = delay_hours !== undefined && delay_hours !== null ? parseInt(delay_hours) : 0;
 
@@ -42,13 +41,13 @@ router.post('/', async (req, res) => {
 async function buildFollowupQueue(followupId, campaignId, delayDays, delayHours) {
   try {
     const sentEmails = await db.all(`
-      SELECT q.id, q.recipient_email, q.account_id, q.message_id, q.sent_at
+      SELECT q.id, q.recipient_email, q.account_id, q.message_id, q.thread_id, q.sent_at
       FROM queue q
       WHERE q.campaign_id = $1
-        AND q.status = 'sent'
-        AND q.recipient_email NOT IN (
-          SELECT email FROM exclusions WHERE campaign_id = $1
-        )
+      AND q.status = 'sent'
+      AND q.recipient_email NOT IN (
+        SELECT email FROM exclusions WHERE campaign_id = $1
+      )
     `, [campaignId]);
 
     for (const email of sentEmails) {
@@ -56,12 +55,12 @@ async function buildFollowupQueue(followupId, campaignId, delayDays, delayHours)
       const scheduledAt = new Date(sentAt.getTime() + (delayDays * 24 * 60 * 60 * 1000) + (delayHours * 60 * 60 * 1000));
 
       await db.run(`
-        INSERT INTO followup_queue 
-          (followup_id, campaign_id, recipient_email, account_id, original_queue_id, message_id, status, scheduled_at)
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+        INSERT INTO followup_queue
+        (followup_id, campaign_id, recipient_email, account_id, original_queue_id, message_id, thread_id, status, scheduled_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
       `, [
         followupId, campaignId, email.recipient_email,
-        email.account_id, email.id, email.message_id,
+        email.account_id, email.id, email.message_id, email.thread_id,
         scheduledAt.toISOString()
       ]);
     }
@@ -79,7 +78,7 @@ router.put('/:id', async (req, res) => {
     const days = delay_days !== undefined && delay_days !== null ? parseInt(delay_days) : 0;
     const hours = delay_hours !== undefined && delay_hours !== null ? parseInt(delay_hours) : 0;
     await db.run(`
-      UPDATE followups SET name = $1, subject = $2, body_html = $3, body_plain = $4, 
+      UPDATE followups SET name = $1, subject = $2, body_html = $3, body_plain = $4,
       delay_days = $5, delay_hours = $6 WHERE id = $7
     `, [name || '', subject || '', body_html || '', body_plain || '', days, hours, req.params.id]);
     res.json({ success: true });

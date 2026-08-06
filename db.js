@@ -29,6 +29,9 @@ async function initDB() {
         created_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')
       );
 
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_list_email 
+        ON contacts(list_name, email);
+
       CREATE TABLE IF NOT EXISTS campaigns (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
@@ -68,7 +71,9 @@ async function initDB() {
         last_error TEXT,
         scheduled_at TEXT,
         sent_at TEXT,
-        error TEXT
+        error TEXT,
+        message_id TEXT,
+        thread_id TEXT
       );
 
       CREATE TABLE IF NOT EXISTS logs (
@@ -81,6 +86,8 @@ async function initDB() {
         retry_count INTEGER DEFAULT 0,
         created_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')
       );
+
+      CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
 
       CREATE TABLE IF NOT EXISTS opens (
         id SERIAL PRIMARY KEY,
@@ -102,6 +109,43 @@ async function initDB() {
         clicked_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS'),
         ip_address TEXT,
         user_agent TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS followups (
+        id SERIAL PRIMARY KEY,
+        campaign_id INTEGER NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        subject TEXT,
+        body_html TEXT,
+        body_plain TEXT,
+        delay_days INTEGER DEFAULT 0,
+        delay_hours INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active',
+        created_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')
+      );
+
+      CREATE TABLE IF NOT EXISTS followup_queue (
+        id SERIAL PRIMARY KEY,
+        followup_id INTEGER NOT NULL,
+        campaign_id INTEGER NOT NULL,
+        recipient_email TEXT NOT NULL,
+        account_id INTEGER,
+        original_queue_id INTEGER,
+        message_id TEXT,
+        thread_id TEXT,
+        status TEXT DEFAULT 'pending',
+        scheduled_at TEXT,
+        retry_count INTEGER DEFAULT 0,
+        error TEXT,
+        sent_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS exclusions (
+        id SERIAL PRIMARY KEY,
+        campaign_id INTEGER,
+        email TEXT NOT NULL,
+        reason TEXT DEFAULT 'replied',
+        created_at TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS')
       );
     `);
     console.log('Database initialized successfully');
